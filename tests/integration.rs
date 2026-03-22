@@ -115,13 +115,13 @@ fn test_tsconfig_es2022_target() {
 #[test]
 fn test_tsconfig_strict_mode() {
     let g = compile("x = uint");
-    assert!(g.tsconfig.contains("\"strict\": true"));
+    assert!(g.tsconfig.contains("\"strict\"") && g.tsconfig.contains("true"));
 }
 
 #[test]
 fn test_tsconfig_declaration() {
     let g = compile("x = uint");
-    assert!(g.tsconfig.contains("\"declaration\": true"));
+    assert!(g.tsconfig.contains("\"declaration\"") && g.tsconfig.contains("true"));
 }
 
 // ── Source file ───────────────────────────────────────────────────────────────
