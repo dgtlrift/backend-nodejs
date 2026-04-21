@@ -141,7 +141,7 @@ fn test_source_imports_cborg() {
 #[test]
 fn test_source_has_validation_error() {
     let g = compile("x = uint");
-    assert!(g.source.contains("CborValidationError"));
+    assert!(g.source.contains("ValidationError"));
 }
 
 #[test]
@@ -416,7 +416,7 @@ fn test_roundtrip_alias_valid_and_invalid() {
     let g = compile("device-id = tstr .size 16");
     assert!(g.tests.contains("valid value"));
     assert!(g.tests.contains("rejects invalid value"));
-    assert!(g.tests.contains("CborValidationError"));
+    assert!(g.tests.contains("ValidationError"));
 }
 
 #[test]
