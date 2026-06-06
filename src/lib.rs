@@ -17,6 +17,74 @@ use cddlc_ir::{
     IrModule, LiteralValue, Occurrence, Primitive, StructDef, TypeDef, TypeRef,
 };
 
+/// Self-contained streaming CBOR encoder emitted into every generated file.
+/// cborg v4 exposes only a high-level `encode()` function; there is no
+/// streaming `Encoder` class.  This thin class satisfies the generated code's
+/// `startMap / text / uint / float32 / writeBytes / finish` interface while
+/// keeping cborg only for the decode path.
+const CBOR_ENCODER_CLASS: &str = r#"class CborEncoder {
+  private _buf: Uint8Array[] = [];
+
+  private _head(major: number, n: number | bigint): void {
+    const v = typeof n === 'bigint' ? n : BigInt(n);
+    if (v < 24n) {
+      this._buf.push(new Uint8Array([(major << 5) | Number(v)]));
+    } else if (v < 0x100n) {
+      this._buf.push(new Uint8Array([(major << 5) | 24, Number(v)]));
+    } else if (v < 0x10000n) {
+      this._buf.push(new Uint8Array([(major << 5) | 25, Number(v >> 8n), Number(v & 0xffn)]));
+    } else if (v < 0x100000000n) {
+      const b = new Uint8Array(5); b[0] = (major << 5) | 26;
+      new DataView(b.buffer).setUint32(1, Number(v)); this._buf.push(b);
+    } else {
+      const b = new Uint8Array(9); b[0] = (major << 5) | 27;
+      new DataView(b.buffer).setBigUint64(1, v); this._buf.push(b);
+    }
+  }
+
+  startMap(n: number): void { this._head(5, n); }
+  endMap(): void {}
+  startArray(n: number): void { this._head(4, n); }
+  endArray(): void {}
+
+  text(s: string): void {
+    const b = new TextEncoder().encode(s);
+    this._head(3, b.length);
+    this._buf.push(b);
+  }
+
+  uint(n: bigint | number): void { this._head(0, n); }
+
+  int(n: bigint | number): void {
+    const v = typeof n === 'bigint' ? n : BigInt(n);
+    if (v >= 0n) { this._head(0, v); } else { this._head(1, -v - 1n); }
+  }
+
+  float32(n: number): void {
+    const b = new Uint8Array(5); b[0] = 0xfa;
+    new DataView(b.buffer).setFloat32(1, n); this._buf.push(b);
+  }
+
+  float64(n: number): void {
+    const b = new Uint8Array(9); b[0] = 0xfb;
+    new DataView(b.buffer).setFloat64(1, n); this._buf.push(b);
+  }
+
+  bool(v: boolean): void { this._buf.push(new Uint8Array([v ? 0xf5 : 0xf4])); }
+  null(): void { this._buf.push(new Uint8Array([0xf6])); }
+
+  bytes(b: Uint8Array): void { this._head(2, b.length); this._buf.push(b); }
+  tag(n: number | bigint): void { this._head(6, n); }
+  writeBytes(b: Uint8Array): void { this._buf.push(b); }
+
+  finish(): Uint8Array {
+    const len = this._buf.reduce((s, c) => s + c.length, 0);
+    const out = new Uint8Array(len); let off = 0;
+    for (const c of this._buf) { out.set(c, off); off += c.length; }
+    return out;
+  }
+}"#;
+
 pub struct NodeJsBackend;
 
 impl Backend for NodeJsBackend {
@@ -113,7 +181,7 @@ fn emit_tsconfig() -> String {
     "rootDir":          ".",
     "strict":           true,
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
+    "exactOptionalPropertyTypes": false,
     "declaration":      true,
     "declarationMap":   true,
     "sourceMap":        true,
@@ -140,7 +208,12 @@ fn emit_source(module: &IrModule, opts: &CodegenOptions) -> String {
         // JSON is a Node.js/browser built-in — no imports needed
         // Buffer for base64url encoding (Node.js built-in)
     } else {
-        w.line("import { encode as cborgEncode, decode as cborgDecode, Encoder } from 'cborg';");
+        w.line("import { encode as cborgEncode, decode as cborgDecode } from 'cborg';");
+        w.blank();
+        // Emit a self-contained streaming CBOR encoder — cborg v4 has no Encoder class.
+        for line in CBOR_ENCODER_CLASS.lines() {
+            if line.is_empty() { w.blank(); } else { w.line(line); }
+        }
     }
     w.blank();
 
@@ -287,7 +360,7 @@ fn emit_struct_encode_cbor(
 
     w.line(&format!("export function {fname}(val: {iname}): Uint8Array {{"));
     w.indent();
-    w.line("const enc = new Encoder({ typeEncoders: {} });");
+    w.line("const enc = new CborEncoder();");
 
     if let Some(tag) = s.tagged {
         w.line(&format!("enc.tag({});", tag.0));
@@ -329,7 +402,7 @@ fn emit_struct_decode_json(
         let ty   = ts_field_type(&f.ty, &f.occurrence, opts);
         match &f.occurrence {
             Occurrence::Optional => {
-                w.line(&format!("const {prop}: {ty} = m[{key:?}] !== undefined"));
+                w.line(&format!("const {prop}: {ty} | undefined = m[{key:?}] != null"));
                 w.indent();
                 let conv = ts_json_decode_expr(&f.ty, &format!("m[{key:?}]"), opts);
                 w.line(&format!("? {conv}"));
@@ -337,7 +410,7 @@ fn emit_struct_decode_json(
                 w.dedent();
             }
             _ => {
-                w.line(&format!("if (m[{key:?}] === undefined) throw new Error('Missing field {key}');"));
+                w.line(&format!("if (m[{key:?}] == null) throw new Error('Missing field {key}');"));
                 let conv = ts_json_decode_expr(&f.ty, &format!("m[{key:?}]"), opts);
                 w.line(&format!("const {prop}: {ty} = {conv};"));
                 emit_ts_validation(w, &f.constraints, &prop, key);
@@ -391,7 +464,9 @@ fn emit_struct_decode_cbor(
         let ty   = ts_field_type(&f.ty, &f.occurrence, opts);
         match &f.occurrence {
             Occurrence::Optional => {
-                w.line(&format!("const {prop}: {ty} = m[{:?}] !== undefined", key));
+                // Encoder writes CBOR null for absent fields; treat both null and
+                // undefined as "absent" so the ternary correctly returns undefined.
+                w.line(&format!("const {prop}: {ty} | undefined = m[{:?}] != null", key));
                 w.indent();
                 let conv = ts_convert_expr(&f.ty, &format!("m[{:?}]", key), opts);
                 w.line(&format!("? {conv}"));
@@ -399,7 +474,7 @@ fn emit_struct_decode_cbor(
                 w.dedent();
             }
             _ => {
-                w.line(&format!("if (m[{:?}] === undefined) throw new Error('Missing field {key}');", key));
+                w.line(&format!("if (m[{:?}] == null) throw new Error('Missing field {key}');", key));
                 let conv = ts_convert_expr(&f.ty, &format!("m[{:?}]", key), opts);
                 w.line(&format!("const {prop}: {ty} = {conv};"));
                 emit_ts_validation(w, &f.constraints, &prop, key);
@@ -487,7 +562,7 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
         w.line("}");
         w.line("throw new Error(`Unknown kind: ${(val as any).kind}`);");
     } else {
-        w.line("const enc = new Encoder({ typeEncoders: {} });");
+        w.line("const enc = new CborEncoder();");
         if let Some(tag) = e.tagged { w.line(&format!("enc.tag({});", tag.0)); }
         w.line("switch (val.kind) {");
         w.indent();
@@ -664,6 +739,7 @@ fn emit_alias(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
             let expr = ts_json_encode_expr(&a.ty, "val", opts);
             w.line(&format!("return new TextEncoder().encode(JSON.stringify({expr}));"));
         } else {
+            w.line("const enc = new CborEncoder();");
             emit_ts_encode_value(w, &a.ty, "val", &Occurrence::Required, opts);
             w.line("return enc.finish();");
         }
@@ -711,7 +787,7 @@ fn emit_alias(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
         let expr = ts_json_encode_expr(&a.ty, "val", opts);
         w.line(&format!("return new TextEncoder().encode(JSON.stringify({expr}));"));
     } else {
-        w.line("const enc = new Encoder({ typeEncoders: {} });");
+        w.line("const enc = new CborEncoder();");
         if let Some(tag) = a.tagged { w.line(&format!("enc.tag({});", tag.0)); }
         emit_ts_encode_primitive_or_named(w, &a.ty, "val", opts);
         w.line("return enc.finish();");
@@ -923,20 +999,20 @@ fn ts_constraint_check(c: &Constraint, expr: &str) -> Option<String> {
             (None, None)         => None,
         },
         Constraint::ValueRangeInt { min, max, inclusive } => {
-            let op = if *inclusive { "=" } else { "" };
+            let (ge, le) = if *inclusive { (">=", "<=") } else { (">", "<") };
             match (min, max) {
-                (Some(lo), Some(hi)) => Some(format!("{expr} >={op} {}n && {expr} <={op} {}n", lo, hi)),
-                (Some(lo), None)     => Some(format!("{expr} >={op} {}n", lo)),
-                (None, Some(hi))     => Some(format!("{expr} <={op} {}n", hi)),
+                (Some(lo), Some(hi)) => Some(format!("{expr} {ge} {lo}n && {expr} {le} {hi}n")),
+                (Some(lo), None)     => Some(format!("{expr} {ge} {lo}n")),
+                (None, Some(hi))     => Some(format!("{expr} {le} {hi}n")),
                 (None, None)         => None,
             }
         }
         Constraint::ValueRangeUint { min, max, inclusive } => {
-            let op = if *inclusive { "=" } else { "" };
+            let (ge, le) = if *inclusive { (">=", "<=") } else { (">", "<") };
             match (min, max) {
-                (Some(lo), Some(hi)) => Some(format!("{expr} >={op} {}n && {expr} <={op} {}n", lo, hi)),
-                (Some(lo), None)     => Some(format!("{expr} >={op} {}n", lo)),
-                (None, Some(hi))     => Some(format!("{expr} <={op} {}n", hi)),
+                (Some(lo), Some(hi)) => Some(format!("{expr} {ge} {lo}n && {expr} {le} {hi}n")),
+                (Some(lo), None)     => Some(format!("{expr} {ge} {lo}n")),
+                (None, Some(hi))     => Some(format!("{expr} {le} {hi}n")),
                 (None, None)         => None,
             }
         }
