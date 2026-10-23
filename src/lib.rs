@@ -13,7 +13,7 @@ use cddlc_codegen::{
     IndentWriter,
 };
 use cddlc_ir::{
-    AliasDef, ArrayDef, Constraint, EnumDef,
+    AliasDef, ArrayDef, Constraint, EnumDef, EnumVariant,
     IrModule, LiteralValue, Occurrence, Primitive, StructDef, TypeDef, TypeRef,
 };
 
@@ -206,7 +206,6 @@ fn emit_source(module: &IrModule, opts: &CodegenOptions) -> String {
     w.blank();
     if opts.is_json() {
         // JSON is a Node.js/browser built-in — no imports needed
-        // Buffer for base64url encoding (Node.js built-in)
     } else {
         w.line("import { encode as cborgEncode, decode as cborgDecode } from 'cborg';");
         w.blank();
@@ -238,17 +237,11 @@ fn emit_source(module: &IrModule, opts: &CodegenOptions) -> String {
     // JSON base64url helpers
     if opts.is_json() {
         w.blank();
-        w.line("function toBase64Url(bytes: Uint8Array): string {");
-        w.indent();
-        w.line("return Buffer.from(bytes).toString('base64url');");
-        w.dedent();
-        w.line("}");
-        w.blank();
-        w.line("function fromBase64Url(s: string): Uint8Array {");
-        w.indent();
-        w.line("return new Uint8Array(Buffer.from(s, 'base64url'));");
-        w.dedent();
-        w.line("}");
+        // Portable base64url (RFC 4648 section 5, no padding): no Node.js `Buffer`, so the
+        // module runs in browsers too.
+        for line in BASE64URL_HELPERS.lines() {
+            if line.is_empty() { w.blank(); } else { w.line(line); }
+        }
     }
 
     w.blank();
@@ -413,7 +406,7 @@ fn emit_struct_decode_json(
                 w.line(&format!("if (m[{key:?}] == null) throw new Error('Missing field {key}');"));
                 let conv = ts_json_decode_expr(&f.ty, &format!("m[{key:?}]"), opts);
                 w.line(&format!("const {prop}: {ty} = {conv};"));
-                emit_ts_validation(w, &f.constraints, &prop, key);
+                emit_ts_validation(w, &f.constraints, &prop, key, opts.is_json());
             }
         }
     }
@@ -477,7 +470,7 @@ fn emit_struct_decode_cbor(
                 w.line(&format!("if (m[{:?}] == null) throw new Error('Missing field {key}');", key));
                 let conv = ts_convert_expr(&f.ty, &format!("m[{:?}]", key), opts);
                 w.line(&format!("const {prop}: {ty} = {conv};"));
-                emit_ts_validation(w, &f.constraints, &prop, key);
+                emit_ts_validation(w, &f.constraints, &prop, key, opts.is_json());
             }
         }
     }
@@ -493,6 +486,63 @@ fn emit_struct_decode_cbor(
     w.line("};");
     w.dedent();
     w.line("}");
+}
+
+/// base64url encode and decode, without padding, in plain TypeScript.
+const BASE64URL_HELPERS: &str = r#"const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+function toBase64Url(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i] ?? 0;
+    const b1 = bytes[i + 1] ?? 0;
+    const b2 = bytes[i + 2] ?? 0;
+    const n = (b0 << 16) | (b1 << 8) | b2;
+    const chars = Math.min(4, Math.ceil(((bytes.length - i) * 8) / 6));
+    for (let j = 0; j < chars; j++) {
+      out += B64URL.charAt((n >> (18 - 6 * j)) & 63);
+    }
+  }
+  return out;
+}
+
+function fromBase64Url(s: string): Uint8Array {
+  const clean = s.replace(/=+$/, '');
+  const out = new Uint8Array(Math.floor((clean.length * 6) / 8));
+  let bits = 0;
+  let acc = 0;
+  let k = 0;
+  for (const ch of clean) {
+    const v = B64URL.indexOf(ch);
+    if (v < 0) throw new Error(`Invalid base64url character: ${ch}`);
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[k++] = (acc >> bits) & 0xff;
+    }
+  }
+  return out;
+}"#;
+
+/// The literal of a `tstr` variant (`"free-space"` in `"free-space" / "log-distance"`).
+fn text_literal(v: &EnumVariant) -> Option<&str> {
+    let lit = v.constraints.iter().find_map(|c| match c {
+        Constraint::Eq(LiteralValue::Text(t)) => Some(t.as_str()),
+        _ => None,
+    });
+    match &v.ty {
+        TypeRef::Primitive(Primitive::Tstr) => lit,
+        _ => None,
+    }
+}
+
+/// The CDDL string of a `tstr` or `null` enum variant: its literal, or (for variants
+/// without one) the historical lowercased-name fallback.
+fn variant_str(v: &EnumVariant) -> String {
+    text_literal(v)
+        .map(str::to_owned)
+        .unwrap_or_else(|| v.name.to_lowercase().replace('_', "-"))
 }
 
 // ── Enum (discriminated union) ────────────────────────────────────────────────
@@ -539,17 +589,17 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
         w.indent();
         for v in &e.variants {
             let vname    = to_pascal_case(&v.name);
-            let cddl_str = v.name.to_lowercase().replace('_', "-");
+            let cddl_str = variant_str(v);
             w.line(&format!("case {:?}:", vname));
             w.indent();
             match &v.ty {
                 TypeRef::Primitive(Primitive::Tstr | Primitive::Null) => {
                     w.line(&format!("return new TextEncoder().encode(JSON.stringify({cddl_str:?}));"));
                 }
-                TypeRef::Named(_) => {
+                TypeRef::Named(n) => {
                     w.line("if (!('value' in val)) throw new Error('Missing value');");
-                    let ef = encode_fn_name(v.name.as_str());
-                    w.line(&format!("return {ef}((val as any).value); break;"));
+                    let ef = encode_fn_name(n);
+                    w.line(&format!("return {ef}((val as any).value);"));
                 }
                 _ => {
                     w.line("if (!('value' in val)) throw new Error('Missing value');");
@@ -572,7 +622,7 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
             w.indent();
             match &v.ty {
                 TypeRef::Primitive(Primitive::Tstr | Primitive::Null) => {
-                    let s = v.name.to_lowercase().replace('_', "-");
+                    let s = variant_str(v);
                     w.line(&format!("enc.text({s:?}); break;"));
                 }
                 TypeRef::Primitive(Primitive::Uint) =>
@@ -619,8 +669,10 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
 
     let has_str = e.variants.iter().any(|v|
         matches!(&v.ty, TypeRef::Primitive(Primitive::Tstr | Primitive::Null)));
-    let has_int = e.variants.iter().any(|v|
-        matches!(&v.ty, TypeRef::Primitive(Primitive::Uint | Primitive::Int)));
+    let is_int = |v: &&EnumVariant| matches!(&v.ty, TypeRef::Primitive(Primitive::Uint | Primitive::Int));
+    let is_float = |v: &&EnumVariant| matches!(&v.ty,
+        TypeRef::Primitive(Primitive::Float | Primitive::Float16 | Primitive::Float32 | Primitive::Float64));
+    let has_int = e.variants.iter().any(|v| is_int(&v));
 
     if has_str {
         w.line("if (typeof inner === 'string') {");
@@ -630,7 +682,7 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
         for v in &e.variants {
             if matches!(&v.ty, TypeRef::Primitive(Primitive::Tstr | Primitive::Null)) {
                 let vname    = to_pascal_case(&v.name);
-                let cddl_str = v.name.to_lowercase().replace('_', "-");
+                let cddl_str = variant_str(v);
                 w.line(&format!("case {cddl_str:?}: return {{ kind: {vname:?} }};"));
             }
         }
@@ -641,19 +693,65 @@ fn emit_enum(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
         w.line("}");
     }
 
-    if has_int {
-        let num_check = if opts.is_json() { "typeof inner === 'number'" } else { "typeof inner === 'bigint'" };
-        w.line(&format!("if ({num_check}) {{"));
-        w.indent();
-        for v in &e.variants {
-            if matches!(&v.ty, TypeRef::Primitive(Primitive::Uint | Primitive::Int)) {
-                let vname = to_pascal_case(&v.name);
-                w.line(&format!("return {{ kind: {vname:?}, value: inner }};"));
-                break;
+    if opts.is_json() {
+        // JSON has one number type: an integer goes to the integer variant if there is
+        // one, any other number to the float variant.
+        let int_v = e.variants.iter().find(is_int);
+        let float_v = e.variants.iter().find(is_float);
+        if int_v.is_some() || float_v.is_some() {
+            w.line("if (typeof inner === 'number') {");
+            w.indent();
+            match (int_v, float_v) {
+                (Some(i), Some(f)) => {
+                    let (iname, fname_) = (to_pascal_case(&i.name), to_pascal_case(&f.name));
+                    w.line(&format!("if (Number.isInteger(inner)) return {{ kind: {iname:?}, value: inner }};"));
+                    w.line(&format!("return {{ kind: {fname_:?}, value: inner }};"));
+                }
+                (Some(v), None) | (None, Some(v)) => {
+                    let vname = to_pascal_case(&v.name);
+                    w.line(&format!("return {{ kind: {vname:?}, value: inner }};"));
+                }
+                (None, None) => unreachable!(),
             }
+            w.dedent();
+            w.line("}");
+        }
+    } else if has_int {
+        w.line("if (typeof inner === 'bigint') {");
+        w.indent();
+        if let Some(v) = e.variants.iter().find(is_int) {
+            let vname = to_pascal_case(&v.name);
+            w.line(&format!("return {{ kind: {vname:?}, value: inner }};"));
         }
         w.dedent();
         w.line("}");
+    }
+    if let Some(v) = e.variants.iter().find(|v| matches!(&v.ty, TypeRef::Primitive(Primitive::Bool))) {
+        let vname = to_pascal_case(&v.name);
+        w.line("if (typeof inner === 'boolean') {");
+        w.indent();
+        w.line(&format!("return {{ kind: {vname:?}, value: inner }};"));
+        w.dedent();
+        w.line("}");
+    }
+    if opts.is_json() {
+        // Map and array variants: the first whose decoder accepts the value.
+        let named: Vec<&EnumVariant> = e.variants.iter()
+            .filter(|v| matches!(&v.ty, TypeRef::Named(_)))
+            .collect();
+        if !named.is_empty() {
+            w.line("if (typeof inner === 'object' && inner !== null) {");
+            w.indent();
+            w.line("const bytes = new TextEncoder().encode(JSON.stringify(inner));");
+            for v in named {
+                let TypeRef::Named(n) = &v.ty else { unreachable!() };
+                let vname = to_pascal_case(&v.name);
+                let df = decode_fn_name(n);
+                w.line(&format!("try {{ return {{ kind: {vname:?}, value: {df}(bytes) }}; }} catch {{ /* next variant */ }}"));
+            }
+            w.dedent();
+            w.line("}");
+        }
     }
 
     w.line(&format!("throw new Error(`Cannot decode {type_name}`);"));
@@ -683,7 +781,7 @@ fn emit_array(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
         if conv == "item" {
             w.line("return new TextEncoder().encode(JSON.stringify(val));");
         } else {
-            w.line(&format!("return new TextEncoder().encode(JSON.stringify((val as unknown[]).map(item => {conv})));"));
+            w.line(&format!("return new TextEncoder().encode(JSON.stringify(val.map(item => {conv})));"));
         }
     } else if let Some(tag) = a.tagged {
         w.line(&format!("return cborgEncode([{}n, val]);", tag.0));
@@ -770,8 +868,8 @@ fn emit_alias(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
     w.line(&format!("export function validate{type_name}(val: {inner_ty}): {type_name} {{"));
     w.indent();
     for c in &a.constraints {
-        if let Some(check) = ts_constraint_check(c, "val") {
-            let msg = ts_constraint_description(c);
+        if let Some(check) = ts_constraint_check(c, "val", opts.is_json()) {
+            let msg = ts_constraint_description(c, opts.is_json());
             w.line(&format!("if (!({check})) throw new ValidationError({type_name:?}, {msg:?});"));
         }
     }
@@ -946,10 +1044,11 @@ fn emit_ts_validation(
     constraints: &[Constraint],
     expr:        &str,
     field_name:  &str,
+    json:        bool,
 ) {
     for c in constraints {
-        if let Some(check) = ts_constraint_check(c, expr) {
-            let msg = ts_constraint_description(c);
+        if let Some(check) = ts_constraint_check(c, expr, json) {
+            let msg = ts_constraint_description(c, json);
             w.line(&format!("if (!({check})) throw new ValidationError({field_name:?}, {msg:?});"));
         }
     }
@@ -988,7 +1087,9 @@ fn ts_convert_primitive(p: &Primitive, expr: &str) -> String {
 
 // ── Constraint helpers ────────────────────────────────────────────────────────
 
-fn ts_constraint_check(c: &Constraint, expr: &str) -> Option<String> {
+fn ts_constraint_check(c: &Constraint, expr: &str, json: bool) -> Option<String> {
+    // JSON integers are `number`; CBOR integers are `bigint`.
+    let n = if json { "" } else { "n" };
     match c {
         Constraint::SizeExact(n) =>
             Some(format!("{expr}.length === {n}")),
@@ -1001,46 +1102,47 @@ fn ts_constraint_check(c: &Constraint, expr: &str) -> Option<String> {
         Constraint::ValueRangeInt { min, max, inclusive } => {
             let (ge, le) = if *inclusive { (">=", "<=") } else { (">", "<") };
             match (min, max) {
-                (Some(lo), Some(hi)) => Some(format!("{expr} {ge} {lo}n && {expr} {le} {hi}n")),
-                (Some(lo), None)     => Some(format!("{expr} {ge} {lo}n")),
-                (None, Some(hi))     => Some(format!("{expr} {le} {hi}n")),
+                (Some(lo), Some(hi)) => Some(format!("{expr} {ge} {lo}{n} && {expr} {le} {hi}{n}")),
+                (Some(lo), None)     => Some(format!("{expr} {ge} {lo}{n}")),
+                (None, Some(hi))     => Some(format!("{expr} {le} {hi}{n}")),
                 (None, None)         => None,
             }
         }
         Constraint::ValueRangeUint { min, max, inclusive } => {
             let (ge, le) = if *inclusive { (">=", "<=") } else { (">", "<") };
             match (min, max) {
-                (Some(lo), Some(hi)) => Some(format!("{expr} {ge} {lo}n && {expr} {le} {hi}n")),
-                (Some(lo), None)     => Some(format!("{expr} {ge} {lo}n")),
-                (None, Some(hi))     => Some(format!("{expr} {le} {hi}n")),
+                (Some(lo), Some(hi)) => Some(format!("{expr} {ge} {lo}{n} && {expr} {le} {hi}{n}")),
+                (Some(lo), None)     => Some(format!("{expr} {ge} {lo}{n}")),
+                (None, Some(hi))     => Some(format!("{expr} {le} {hi}{n}")),
                 (None, None)         => None,
             }
         }
-        Constraint::Eq(v)  => Some(format!("{expr} === {}", ts_literal(v))),
-        Constraint::Ne(v)  => Some(format!("{expr} !== {}", ts_literal(v))),
+        Constraint::Eq(v)  => Some(format!("{expr} === {}", ts_literal(v, json))),
+        Constraint::Ne(v)  => Some(format!("{expr} !== {}", ts_literal(v, json))),
         Constraint::Regexp { hook: Some(h), .. } => Some(format!("{h}({expr})")),
         _ => None,
     }
 }
 
-fn ts_constraint_description(c: &Constraint) -> String {
+fn ts_constraint_description(c: &Constraint, json: bool) -> String {
     match c {
         Constraint::SizeExact(n)    => format!("length must be {n}"),
         Constraint::SizeRange { min, max } => format!("length out of range ({min:?}..{max:?})"),
         Constraint::ValueRangeInt { min, max, .. } => format!("value out of range ({min:?}..{max:?})"),
         Constraint::ValueRangeUint { min, max, .. } => format!("value out of range ({min:?}..{max:?})"),
-        Constraint::Eq(v)  => format!("must equal {}", ts_literal(v)),
-        Constraint::Ne(v)  => format!("must not equal {}", ts_literal(v)),
+        Constraint::Eq(v)  => format!("must equal {}", ts_literal(v, json)),
+        Constraint::Ne(v)  => format!("must not equal {}", ts_literal(v, json)),
         _                  => "constraint violated".into(),
     }
 }
 
-fn ts_literal(v: &LiteralValue) -> String {
+fn ts_literal(v: &LiteralValue, json: bool) -> String {
+    let suffix = if json { "" } else { "n" };
     match v {
         LiteralValue::Bool(b)  => b.to_string(),
         LiteralValue::Null     => "null".into(),
-        LiteralValue::Uint(n)  => format!("{n}n"),
-        LiteralValue::Int(n)   => format!("{n}n"),
+        LiteralValue::Uint(n)  => format!("{n}{suffix}"),
+        LiteralValue::Int(n)   => format!("{n}{suffix}"),
         LiteralValue::Float(f) => format!("{f}"),
         LiteralValue::Text(s)  => format!("{s:?}"),
         LiteralValue::Bytes(_) => "new Uint8Array()".into(),
