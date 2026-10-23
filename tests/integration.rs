@@ -440,3 +440,64 @@ device-id = tstr .size 16
     assert!(g.source.contains("DeviceId"));
     assert!(g.source.contains(".length === 16"));
 }
+
+// ── JSON format (ariel-sim fixes) ─────────────────────────────────────────────
+
+fn compile_json(src: &str) -> GeneratedPackage {
+    let opts = CodegenOptions {
+        format: cddlc_codegen::Format::Json,
+        ..CodegenOptions::default()
+    };
+    compile_with_opts(src, opts)
+}
+
+#[test]
+fn test_json_enum_uses_exact_literals() {
+    let g = compile_json(r#"propagation = "free-space" / "log-distance""#);
+    assert!(g.source.contains(r#"JSON.stringify("free-space")"#), "{}", g.source);
+    assert!(g.source.contains(r#"case "log-distance": return { kind: "LogDistance" };"#));
+    assert!(!g.source.contains("freespace"));
+}
+
+#[test]
+fn test_cbor_enum_uses_exact_literals() {
+    let g = compile(r#"phy = "ieee802154-oqpsk2450" / "lora""#);
+    assert!(g.source.contains(r#"enc.text("ieee802154-oqpsk2450")"#), "{}", g.source);
+}
+
+#[test]
+fn test_json_integer_literals_are_numbers() {
+    let g = compile_json(r#"header = { version: 5, schema: "x" }"#);
+    assert!(g.source.contains("version === 5)"), "{}", g.source);
+    assert!(!g.source.contains("5n"));
+    let g = compile(r#"header = { version: 5 }"#);
+    assert!(g.source.contains("version === 5n)"), "CBOR keeps bigint: {}", g.source);
+}
+
+#[test]
+fn test_json_array_encode_is_typed() {
+    let g = compile_json("point = { x: float }\npoints = [* point]");
+    assert!(g.source.contains("JSON.stringify(val.map(item =>"), "{}", g.source);
+    assert!(!g.source.contains("(val as unknown[]).map"));
+}
+
+#[test]
+fn test_json_choice_decodes_maps_and_numbers() {
+    let g = compile_json(
+        "mode = \"fast\" / realtime\nrealtime = { speed: float }\noverride = float / \"off\"",
+    );
+    assert!(g.source.contains("typeof inner === 'object' && inner !== null"), "{}", g.source);
+    assert!(g.source.contains("value: decodeRealtime(bytes)"), "{}", g.source);
+    assert!(g.source.contains("return encodeRealtime((val as any).value);"), "{}", g.source);
+    // A float variant decodes from a JSON number.
+    let float_case = g.source.split("export function decodeOverride").nth(1).unwrap();
+    assert!(float_case.contains("typeof inner === 'number'"), "{float_case}");
+}
+
+#[test]
+fn test_json_base64url_without_buffer() {
+    let g = compile_json("blob = { data: bstr }");
+    assert!(!g.source.contains("Buffer"), "{}", g.source);
+    assert!(g.source.contains("function toBase64Url(bytes: Uint8Array): string"));
+    assert!(g.source.contains("function fromBase64Url(s: string): Uint8Array"));
+}
