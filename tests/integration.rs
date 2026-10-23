@@ -1,3 +1,7 @@
+use backend_nodejs::NodeJsBackend;
+use cddlc_codegen::{Backend, CodegenOptions};
+use cddlc_ir::lower;
+use cddlc_parser::parse_cddl;
 /// Integration tests for backend-nodejs.
 ///
 /// The backend emits 4 files:
@@ -5,20 +9,15 @@
 ///   files[1] = tsconfig.json
 ///   files[2] = src/<module>.ts
 ///   files[3] = tests/roundtrip.test.ts
-
 use std::path::PathBuf;
-use backend_nodejs::NodeJsBackend;
-use cddlc_codegen::{Backend, CodegenOptions};
-use cddlc_ir::lower;
-use cddlc_parser::parse_cddl;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 struct GeneratedPackage {
     package_json: String,
-    tsconfig:     String,
-    source:       String,
-    tests:        String,
+    tsconfig: String,
+    source: String,
+    tests: String,
 }
 
 fn compile(src: &str) -> GeneratedPackage {
@@ -26,15 +25,17 @@ fn compile(src: &str) -> GeneratedPackage {
 }
 
 fn compile_with_opts(src: &str, opts: CodegenOptions) -> GeneratedPackage {
-    let parsed  = parse_cddl(src, PathBuf::from("test.cddl")).expect("parse");
+    let parsed = parse_cddl(src, PathBuf::from("test.cddl")).expect("parse");
     let lowered = lower(&parsed.value, 16, 64).expect("lower");
-    let out     = NodeJsBackend.generate(&lowered.module, &opts).expect("generate");
+    let out = NodeJsBackend
+        .generate(&lowered.module, &opts)
+        .expect("generate");
     assert_eq!(out.files.len(), 4, "expected 4 output files");
     GeneratedPackage {
         package_json: out.files[0].content.clone(),
-        tsconfig:     out.files[1].content.clone(),
-        source:       out.files[2].content.clone(),
-        tests:        out.files[3].content.clone(),
+        tsconfig: out.files[1].content.clone(),
+        source: out.files[2].content.clone(),
+        tests: out.files[3].content.clone(),
     }
 }
 
@@ -42,10 +43,10 @@ fn compile_with_opts(src: &str, opts: CodegenOptions) -> GeneratedPackage {
 
 #[test]
 fn test_emits_four_files() {
-    let opts   = CodegenOptions::default();
+    let opts = CodegenOptions::default();
     let parsed = parse_cddl("x = uint", PathBuf::from("t.cddl")).unwrap();
     let lowered = lower(&parsed.value, 16, 64).unwrap();
-    let out    = NodeJsBackend.generate(&lowered.module, &opts).unwrap();
+    let out = NodeJsBackend.generate(&lowered.module, &opts).unwrap();
     assert_eq!(out.files.len(), 4);
     assert!(out.files[0].path.ends_with("package.json"));
     assert!(out.files[1].path.ends_with("tsconfig.json"));
@@ -55,10 +56,10 @@ fn test_emits_four_files() {
 
 #[test]
 fn test_crate_dir_named_after_module() {
-    let opts   = CodegenOptions::default();
+    let opts = CodegenOptions::default();
     let parsed = parse_cddl("x = uint", PathBuf::from("sensor.cddl")).unwrap();
     let lowered = lower(&parsed.value, 16, 64).unwrap();
-    let out    = NodeJsBackend.generate(&lowered.module, &opts).unwrap();
+    let out = NodeJsBackend.generate(&lowered.module, &opts).unwrap();
     assert!(out.files[0].path.starts_with("sensor-cbor/"));
     assert!(out.files[2].path.starts_with("sensor-cbor/src/"));
     assert!(out.files[3].path.starts_with("sensor-cbor/tests/"));
@@ -147,8 +148,12 @@ fn test_source_has_validation_error() {
 #[test]
 fn test_source_exports_are_named() {
     let g = compile("sensor = { id: uint }");
-    assert!(g.source.contains("export interface") || g.source.contains("export type") ||
-            g.source.contains("export function") || g.source.contains("export class"));
+    assert!(
+        g.source.contains("export interface")
+            || g.source.contains("export type")
+            || g.source.contains("export function")
+            || g.source.contains("export class")
+    );
 }
 
 // ── Struct ────────────────────────────────────────────────────────────────────
@@ -186,8 +191,7 @@ fn test_struct_tstr_is_string() {
 #[test]
 fn test_struct_optional_field() {
     let g = compile("msg = { id: uint, ? label: tstr }");
-    assert!(g.source.contains("readonly label?: string") ||
-            g.source.contains("label?:"));
+    assert!(g.source.contains("readonly label?: string") || g.source.contains("label?:"));
 }
 
 #[test]
@@ -427,16 +431,17 @@ fn test_roundtrip_array_empty() {
 
 #[test]
 fn test_iot_schema() {
-    let g = compile(r#"
+    let g = compile(
+        r#"
 sensor-message = {
     version:   uint,
     device-id: device-id,
     timestamp: #6.1(uint),
 }
 device-id = tstr .size 16
-"#);
-    assert!(g.source.contains("interface SensorMessage") ||
-            g.source.contains("SensorMessage"));
+"#,
+    );
+    assert!(g.source.contains("interface SensorMessage") || g.source.contains("SensorMessage"));
     assert!(g.source.contains("DeviceId"));
     assert!(g.source.contains(".length === 16"));
 }
@@ -454,15 +459,25 @@ fn compile_json(src: &str) -> GeneratedPackage {
 #[test]
 fn test_json_enum_uses_exact_literals() {
     let g = compile_json(r#"propagation = "free-space" / "log-distance""#);
-    assert!(g.source.contains(r#"JSON.stringify("free-space")"#), "{}", g.source);
-    assert!(g.source.contains(r#"case "log-distance": return { kind: "LogDistance" };"#));
+    assert!(
+        g.source.contains(r#"JSON.stringify("free-space")"#),
+        "{}",
+        g.source
+    );
+    assert!(g
+        .source
+        .contains(r#"case "log-distance": return { kind: "LogDistance" };"#));
     assert!(!g.source.contains("freespace"));
 }
 
 #[test]
 fn test_cbor_enum_uses_exact_literals() {
     let g = compile(r#"phy = "ieee802154-oqpsk2450" / "lora""#);
-    assert!(g.source.contains(r#"enc.text("ieee802154-oqpsk2450")"#), "{}", g.source);
+    assert!(
+        g.source.contains(r#"enc.text("ieee802154-oqpsk2450")"#),
+        "{}",
+        g.source
+    );
 }
 
 #[test]
@@ -471,13 +486,21 @@ fn test_json_integer_literals_are_numbers() {
     assert!(g.source.contains("version === 5)"), "{}", g.source);
     assert!(!g.source.contains("5n"));
     let g = compile(r#"header = { version: 5 }"#);
-    assert!(g.source.contains("version === 5n)"), "CBOR keeps bigint: {}", g.source);
+    assert!(
+        g.source.contains("version === 5n)"),
+        "CBOR keeps bigint: {}",
+        g.source
+    );
 }
 
 #[test]
 fn test_json_array_encode_is_typed() {
     let g = compile_json("point = { x: float }\npoints = [* point]");
-    assert!(g.source.contains("JSON.stringify(val.map(item =>"), "{}", g.source);
+    assert!(
+        g.source.contains("JSON.stringify(val.map(item =>"),
+        "{}",
+        g.source
+    );
     assert!(!g.source.contains("(val as unknown[]).map"));
 }
 
@@ -486,18 +509,113 @@ fn test_json_choice_decodes_maps_and_numbers() {
     let g = compile_json(
         "mode = \"fast\" / realtime\nrealtime = { speed: float }\noverride = float / \"off\"",
     );
-    assert!(g.source.contains("typeof inner === 'object' && inner !== null"), "{}", g.source);
-    assert!(g.source.contains("value: decodeRealtime(bytes)"), "{}", g.source);
-    assert!(g.source.contains("return encodeRealtime((val as any).value);"), "{}", g.source);
+    assert!(
+        g.source
+            .contains("typeof inner === 'object' && inner !== null"),
+        "{}",
+        g.source
+    );
+    assert!(
+        g.source.contains("value: decodeRealtime(bytes)"),
+        "{}",
+        g.source
+    );
+    assert!(
+        g.source
+            .contains("return encodeRealtime((val as any).value);"),
+        "{}",
+        g.source
+    );
     // A float variant decodes from a JSON number.
-    let float_case = g.source.split("export function decodeOverride").nth(1).unwrap();
-    assert!(float_case.contains("typeof inner === 'number'"), "{float_case}");
+    let float_case = g
+        .source
+        .split("export function decodeOverride")
+        .nth(1)
+        .unwrap();
+    assert!(
+        float_case.contains("typeof inner === 'number'"),
+        "{float_case}"
+    );
 }
 
 #[test]
 fn test_json_base64url_without_buffer() {
     let g = compile_json("blob = { data: bstr }");
     assert!(!g.source.contains("Buffer"), "{}", g.source);
-    assert!(g.source.contains("function toBase64Url(bytes: Uint8Array): string"));
-    assert!(g.source.contains("function fromBase64Url(s: string): Uint8Array"));
+    assert!(g
+        .source
+        .contains("function toBase64Url(bytes: Uint8Array): string"));
+    assert!(g
+        .source
+        .contains("function fromBase64Url(s: string): Uint8Array"));
+}
+
+// ── JSON decoders check primitive types (issue #2) ─────────────────────────────
+
+#[test]
+fn test_json_fields_are_type_checked() {
+    let g =
+        compile_json("rec = { s: tstr, u: uint, i: int, f: float, b: bool, ? n: null, ? d: bstr }");
+    for want in [
+        r#"expectString(m["s"], "s")"#,
+        r#"expectUint(m["u"], "u")"#,
+        r#"expectInt(m["i"], "i")"#,
+        r#"expectNumber(m["f"], "f")"#,
+        r#"expectBool(m["b"], "b")"#,
+        r#"expectNull(m["n"], "n")"#,
+        r#"fromBase64Url(expectString(m["d"], "d"))"#,
+    ] {
+        assert!(g.source.contains(want), "missing {want}:\n{}", g.source);
+    }
+    // No bare conversion is left (`expectString(` contains `String(`, so look at what
+    // precedes each one).
+    for coerced in ["String(m[", "Number(m[", "Boolean(m["] {
+        for (i, _) in g.source.match_indices(coerced) {
+            assert!(
+                g.source[..i].ends_with("expect"),
+                "still coerces at {i}: {coerced}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_json_array_items_and_aliases_are_type_checked() {
+    let g = compile_json("names = [* tstr]\ncount = uint .le 10");
+    assert!(
+        g.source.contains(r#"expectString(item, "Names item")"#),
+        "{}",
+        g.source
+    );
+    assert!(
+        g.source.contains(r#"expectUint(raw, "Count")"#),
+        "{}",
+        g.source
+    );
+    assert!(!g.source.contains("String(item)"));
+}
+
+#[test]
+fn test_json_check_helpers_reject_wrong_types() {
+    let g = compile_json("rec = { s: tstr }");
+    for helper in [
+        "function expectString(v: unknown, at: string): string",
+        "function expectUint(v: unknown, at: string): number",
+        "function expectInt(v: unknown, at: string): number",
+        "function expectNumber(v: unknown, at: string): number",
+        "function expectBool(v: unknown, at: string): boolean",
+        "function expectNull(v: unknown, at: string): null",
+    ] {
+        assert!(g.source.contains(helper), "missing {helper}");
+    }
+    // uint: an integer at least 0; int: an integer; any finite number for floats.
+    assert!(g.source.contains("if (n < 0) throw"));
+    assert!(g.source.contains("if (!Number.isInteger(n)) throw"));
+    assert!(g.source.contains("!Number.isFinite(v)"));
+}
+
+#[test]
+fn test_cbor_output_has_no_json_checks() {
+    let g = compile("rec = { s: tstr, u: uint }");
+    assert!(!g.source.contains("expectString"), "{}", g.source);
 }
