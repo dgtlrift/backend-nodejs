@@ -417,6 +417,13 @@ fn emit_struct_encode_cbor(
     w.line("}");
 }
 
+/// The local a decoder holds field `prop` in: prefixed, so a field can't share a name
+/// with the decoder's own locals (`data`, `raw`, `m`, `map`, `decoded`), whatever the
+/// schema calls it.
+fn field_local(prop: &str) -> String {
+    format!("f_{prop}")
+}
+
 fn emit_struct_decode_json(
     w: &mut IndentWriter,
     s: &StructDef,
@@ -439,12 +446,13 @@ fn emit_struct_decode_json(
 
     for f in &s.fields {
         let prop = to_snake_case(&f.name);
+        let local = field_local(&prop);
         let key = f.name.as_str();
         let ty = ts_field_type(&f.ty, &f.occurrence, opts);
         match &f.occurrence {
             Occurrence::Optional => {
                 w.line(&format!(
-                    "const {prop}: {ty} | undefined = m[{key:?}] != null"
+                    "const {local}: {ty} | undefined = m[{key:?}] != null"
                 ));
                 w.indent();
                 let conv = ts_json_decode_expr(&f.ty, &format!("m[{key:?}]"), key, opts);
@@ -457,8 +465,8 @@ fn emit_struct_decode_json(
                     "if (m[{key:?}] == null) throw new Error('Missing field {key}');"
                 ));
                 let conv = ts_json_decode_expr(&f.ty, &format!("m[{key:?}]"), key, opts);
-                w.line(&format!("const {prop}: {ty} = {conv};"));
-                emit_ts_validation(w, &f.constraints, &prop, key, opts.is_json());
+                w.line(&format!("const {local}: {ty} = {conv};"));
+                emit_ts_validation(w, &f.constraints, &local, key, opts.is_json());
             }
         }
     }
@@ -468,7 +476,8 @@ fn emit_struct_decode_json(
     w.indent();
     for f in &s.fields {
         let prop = to_snake_case(&f.name);
-        w.line(&format!("{prop},"));
+        let local = field_local(&prop);
+        w.line(&format!("{prop}: {local},"));
     }
     w.dedent();
     w.line("};");
@@ -510,6 +519,7 @@ fn emit_struct_decode_cbor(
 
     for f in &s.fields {
         let prop = to_snake_case(&f.name);
+        let local = field_local(&prop);
         let key = f.name.as_str();
         let ty = ts_field_type(&f.ty, &f.occurrence, opts);
         match &f.occurrence {
@@ -517,7 +527,7 @@ fn emit_struct_decode_cbor(
                 // Encoder writes CBOR null for absent fields; treat both null and
                 // undefined as "absent" so the ternary correctly returns undefined.
                 w.line(&format!(
-                    "const {prop}: {ty} | undefined = m[{:?}] != null",
+                    "const {local}: {ty} | undefined = m[{:?}] != null",
                     key
                 ));
                 w.indent();
@@ -532,8 +542,8 @@ fn emit_struct_decode_cbor(
                     key
                 ));
                 let conv = ts_convert_expr(&f.ty, &format!("m[{:?}]", key), opts);
-                w.line(&format!("const {prop}: {ty} = {conv};"));
-                emit_ts_validation(w, &f.constraints, &prop, key, opts.is_json());
+                w.line(&format!("const {local}: {ty} = {conv};"));
+                emit_ts_validation(w, &f.constraints, &local, key, opts.is_json());
             }
         }
     }
@@ -543,7 +553,8 @@ fn emit_struct_decode_cbor(
     w.indent();
     for f in &s.fields {
         let prop = to_snake_case(&f.name);
-        w.line(&format!("{prop},"));
+        let local = field_local(&prop);
+        w.line(&format!("{prop}: {local},"));
     }
     w.dedent();
     w.line("};");
