@@ -619,3 +619,25 @@ fn test_cbor_output_has_no_json_checks() {
     let g = compile("rec = { s: tstr, u: uint }");
     assert!(!g.source.contains("expectString"), "{}", g.source);
 }
+
+// ── Field names that are the decoder's own locals ────────────────────────────
+
+/// A field may be called `data`, `raw`, `m`, `map` or `decoded`, which the decoders use
+/// for their parameter and locals: field values are held in prefixed locals, so no
+/// declaration is duplicated, in either format.
+#[test]
+fn test_fields_named_like_decoder_locals() {
+    let src = "Rec = { data: bstr, raw: uint, m: tstr, map: uint, decoded: bool, ? inner: uint }";
+    for g in [compile(src), compile_json(src)] {
+        for name in ["data", "raw", "m", "map", "decoded", "inner"] {
+            assert!(
+                g.source.contains(&format!("const f_{name}:")),
+                "{name}:\n{}",
+                g.source
+            );
+            assert!(g.source.contains(&format!("{name}: f_{name},")), "{name}");
+        }
+        assert!(!g.source.contains("const data:"), "{}", g.source);
+        assert!(g.source.contains("(data: Uint8Array)"));
+    }
+}
